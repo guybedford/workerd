@@ -1634,8 +1634,8 @@ class FifoFile final: public File, public kj::EnableAddRefToThis<FifoFile> {
     };
   }
 
-  kj::Rc<File> clone(jsg::Lock&) override {
-    return addRefToThis();
+  kj::OneOf<FsError, kj::Rc<File>> clone(jsg::Lock&) override {
+    return kj::Rc<File>(addRefToThis());
   }
 
   kj::Maybe<FsError> replace(jsg::Lock& js, kj::Rc<File> file) override {
@@ -1707,9 +1707,21 @@ class FifoFile final: public File, public kj::EnableAddRefToThis<FifoFile> {
     return bytesToRead;
   }
 
+  kj::StringPtr getUniqueId(jsg::Lock&) const override {
+    KJ_IF_SOME(id, maybeUniqueId) {
+      return id;
+    }
+    // Generating a UUID requires randomness, which requires an IoContext.
+    JSG_REQUIRE(IoContext::hasCurrent(), Error, "Cannot generate a unique ID outside of a request");
+    auto& ioContext = IoContext::current();
+    maybeUniqueId = workerd::randomUUID(ioContext.getEntropySource());
+    return KJ_ASSERT_NONNULL(maybeUniqueId);
+  }
+
  private:
   mutable kj::Vector<kj::byte> fifoBuffer;
   mutable kj::Maybe<jsg::ExternalMemoryAdjustment> maybeExternalMemoryAdjustment;
+  mutable kj::Maybe<kj::String> maybeUniqueId;
 };
 
 }  // namespace

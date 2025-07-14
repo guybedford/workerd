@@ -1,4 +1,5 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:build/wd_test.bzl", "wd_test")
 
 wd_test(
@@ -460,4 +461,23 @@ js_binary(
     name = "sidecar-supervisor",
     entry_point = "sidecar-supervisor.mjs",
     visibility = ["//visibility:public"],
+)
+
+wd_test(
+    src = "process-stdio-nodejs-test.wd-test",
+    args = ["--experimental"],
+    data = ["process-stdio-test.js"],
+)
+
+sh_test(
+    name = "process-stdio-golden-test",
+    srcs = ["test_process_stdio.sh"],
+    args = ["$(location //src/workerd/server:workerd)"],
+    data = [
+        "process-stdio-test.expected_stderr",
+        "process-stdio-test.expected_stdout",
+        "process-stdio-test.js",
+        "process-stdio-test.wd-test",
+        "//src/workerd/server:workerd",
+    ],
 )

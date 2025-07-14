@@ -58,7 +58,7 @@ function chunkToBuffer(
   encoding: BufferEncoding
 ): Uint8Array {
   if (typeof chunk === 'string') {
-    return new Uint8Array(Buffer.from(chunk, encoding));
+    chunk = Buffer.from(chunk, encoding);
   }
   return new Uint8Array(
     Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
