@@ -18,8 +18,10 @@ import processImpl from 'node-internal:process';
 import { Buffer } from 'node-internal:internal_buffer';
 import { parseEnv } from 'node-internal:internal_utils';
 import type * as NodeFS from 'node:fs';
-import { Readable } from 'node-internal:streams_readable';
 import { Writable } from 'node-internal:streams_writable';
+import type { Readable } from 'node-internal:streams_readable';
+import { ReadStream } from 'node-internal:internal_fs_streams';
+import { writeSync } from 'node-internal:internal_fs_sync';
 
 const { compatibilityFlags } = Cloudflare;
 
@@ -31,107 +33,60 @@ import {
   features,
   _setEventsProcess,
 } from 'node-internal:internal_process';
-import type { WritableOptions } from 'node:stream';
 
 export { platform, nextTick, emitWarning, env, features };
 
-/**
- * Mock non-TTY TTY ReadStream
- */
-class ReadStream extends Readable {
-  fd: number = 0;
-  isTTY: boolean = false;
-  isRaw: boolean = false;
-  setRawMode(_mode: boolean): this {
-    return this;
-  }
-}
-
-export const stdin = new ReadStream({
-  read(): void {
-    this.push(null);
-  },
-});
+// For stdin, we emulate `node foo.js < /dev/null`
+// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+export const stdin = new ReadStream(null, {
+  fd: 0,
+  autoClose: false,
+}) as Readable & {
+  fd: number;
+};
+stdin.fd = 0;
 
 function chunkToBuffer(
   chunk: Buffer | ArrayBufferView | DataView | string,
   encoding: BufferEncoding
-): Uint8Array {
+): Buffer {
+  if (Buffer.isBuffer(chunk)) {
+    return chunk;
+  }
   if (typeof chunk === 'string') {
-    chunk = Buffer.from(chunk, encoding);
+    return Buffer.from(chunk, encoding);
   }
-  return new Uint8Array(
-    Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
-  );
+  return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
 }
 
-/**
- * Mock non-TTY TTY WriteStream
- */
-class WriteStream extends Writable {
+// For stdout, we emulate `nohup node foo.js`
+class SyncWriteStream extends Writable {
   fd: number;
-  isTTY: boolean = false;
-  columns: number = 120;
-  rows: number = 40;
-
-  constructor(opts: WritableOptions, fd: number) {
-    super(opts);
+  readable: boolean;
+  _type = 'fs';
+  _isStdio = true;
+  constructor(fd: number) {
+    super({ autoDestroy: true });
     this.fd = fd;
+    this.readable = false;
   }
-  getColorDepth(_env?: object): number {
-    return 1;
-  }
-  hasColors(_count?: number, _env?: object): boolean {
-    return false;
-  }
-  clearLine(_dir: -1 | 0 | 1, callback?: () => void): boolean {
-    if (callback) nextTick(callback);
-    return true;
-  }
-  clearScreenDown(callback?: () => void): boolean {
-    if (callback) nextTick(callback);
-    return true;
-  }
-  cursorTo(_x: number, _y?: number, callback?: () => void): boolean {
-    if (callback) nextTick(callback);
-    return true;
-  }
-  moveCursor(_dx: number, _dy: number, callback?: () => void): boolean {
-    if (callback) nextTick(callback);
-    return true;
-  }
-  getWindowSize(): [number, number] {
-    return [this.columns, this.rows];
+  override _write(
+    chunk: string | Buffer | ArrayBufferView | DataView,
+    encoding: BufferEncoding,
+    cb: (error?: Error | null) => void
+  ): void {
+    try {
+      writeSync(this.fd, chunkToBuffer(chunk, encoding));
+    } catch (e: unknown) {
+      cb(e as Error);
+      return;
+    }
+    cb();
   }
 }
 
-export const stdout = new WriteStream(
-  {
-    write(
-      chunk: string | Buffer | ArrayBufferView | DataView,
-      encoding: BufferEncoding,
-      callback: (error?: Error | null) => void
-    ): void {
-      processImpl.writeAndFlush(1, chunkToBuffer(chunk, encoding));
-      callback();
-    },
-  },
-  1
-);
-
-export const stderr = new WriteStream(
-  {
-    write(
-      chunk: string | Buffer | ArrayBufferView | DataView,
-      encoding: BufferEncoding,
-      callback: (error?: Error | null) => void
-    ): void {
-      processImpl.writeAndFlush(2, chunkToBuffer(chunk, encoding));
-      callback();
-    },
-  },
-  2
-);
+export const stdout = new SyncWriteStream(1);
+export const stderr = new SyncWriteStream(2);
 
 // TODO(soon): Implement along with FS work (and as a requirement for removing experimental).
 export const chdir = undefined;
