@@ -1610,6 +1610,143 @@ class DevRandomFile final: public File, public kj::EnableAddRefToThis<DevRandomF
   mutable kj::Maybe<kj::String> maybeUniqueId;
 };
 
+// A growable ring buffer implementation for efficient FIFO operations
+class GrowableRingBuffer {
+ private:
+  static constexpr size_t kInitialCapacity = 2048;
+  static constexpr size_t kMaxCapacity = 4 * 1024 * 1024;  // 4MB max
+
+  kj::Array<kj::byte> buffer;
+
+  size_t capacity;
+  size_t head;  // Index of the first byte to read
+  size_t tail;  // Index where the next byte will be written
+
+  void grow(size_t minCapacity) {
+    size_t newCapacity = capacity == 0 ? kInitialCapacity : capacity * 2;
+    while (newCapacity < minCapacity && newCapacity < kMaxCapacity) {
+      newCapacity *= 2;
+    }
+    newCapacity = kj::min(newCapacity, kMaxCapacity);
+
+    auto newBuffer = kj::heapArray<kj::byte>(newCapacity);
+
+    size_t currentSize = size();
+    if (currentSize > 0) {
+      if (tail >= head) {
+        newBuffer.first(currentSize).copyFrom(buffer.slice(head, tail));
+      } else {
+        size_t firstChunkSize = capacity - head;
+        newBuffer.first(firstChunkSize).copyFrom(buffer.slice(head, capacity));
+        newBuffer.slice(firstChunkSize, firstChunkSize + tail).copyFrom(buffer.first(tail));
+      }
+    }
+
+    buffer = kj::mv(newBuffer);
+    capacity = newCapacity;
+    head = 0;
+    tail = currentSize;
+  }
+
+ public:
+  GrowableRingBuffer(): buffer(nullptr), capacity(0), head(0), tail(0) {}
+
+  size_t size() const {
+    if (capacity == 0) return 0;
+    if (tail >= head) {
+      return tail - head;
+    } else {
+      return capacity - head + tail;
+    }
+  }
+
+  size_t getCapacity() const {
+    return capacity;
+  }
+
+  size_t remainingCapacity() const {
+    if (capacity == 0) return 0;
+    return capacity - size() - 1;  // -1 to distinguish full from empty
+  }
+
+  // Writes data to the buffer, growing if necessary or overwriting old data
+  // Returns the change in allocated capacity (for memory tracking)
+  int64_t write(kj::ArrayPtr<const kj::byte> data) {
+    size_t dataSize = data.size();
+    if (dataSize == 0) return 0;
+
+    if (dataSize >= kMaxCapacity - 1) {
+      head = 0;
+      tail = 0;
+      data = data.slice(dataSize - (kMaxCapacity - 1));
+      dataSize = kMaxCapacity - 1;
+    }
+
+    size_t currentSize = size();
+    size_t oldCapacity = capacity;
+
+    size_t neededCapacity = currentSize + dataSize + 1;  // +1 for the empty slot
+    if (capacity == 0 || neededCapacity > capacity) {
+      if (neededCapacity > kMaxCapacity) {
+        if (capacity < kMaxCapacity) {
+          grow(kMaxCapacity);
+        }
+
+        // Calculate how much old data to drop
+        // We can store at most (kMaxCapacity - 1) bytes
+        size_t maxStorable = kMaxCapacity - 1;
+        size_t totalData = currentSize + dataSize;
+
+        if (totalData > maxStorable) {
+          size_t toDrop = totalData - maxStorable;
+          head = (head + toDrop) % capacity;
+        }
+      } else {
+        // Normal growth
+        grow(neededCapacity);
+      }
+    }
+
+    size_t firstChunkSize = kj::min(dataSize, capacity - tail);
+    buffer.slice(tail, tail + firstChunkSize).copyFrom(data.first(firstChunkSize));
+
+    if (firstChunkSize < dataSize) {
+      size_t secondChunkSize = dataSize - firstChunkSize;
+      buffer.first(secondChunkSize).copyFrom(data.slice(firstChunkSize));
+      tail = secondChunkSize;
+    } else {
+      tail = (tail + firstChunkSize) % capacity;
+    }
+
+    return static_cast<int64_t>(capacity) - static_cast<int64_t>(oldCapacity);
+  }
+
+  size_t read(kj::ArrayPtr<kj::byte> output) const {
+    size_t available = size();
+    size_t toRead = kj::min(output.size(), available);
+
+    if (toRead == 0) return 0;
+
+    size_t firstChunkSize = kj::min(toRead, capacity - head);
+    output.first(firstChunkSize).copyFrom(buffer.slice(head, head + firstChunkSize));
+
+    if (firstChunkSize < toRead) {
+      size_t secondChunkSize = toRead - firstChunkSize;
+      output.slice(firstChunkSize, firstChunkSize + secondChunkSize)
+          .copyFrom(buffer.first(secondChunkSize));
+      const_cast<size_t&>(head) = secondChunkSize;
+    } else {
+      const_cast<size_t&>(head) = (head + firstChunkSize) % capacity;
+    }
+
+    if (head == tail) {
+      const_cast<size_t&>(head) = const_cast<size_t&>(tail) = 0;
+    }
+
+    return toRead;
+  }
+};
+
 // A variation on a file that acts like a FIFO. Every call to read should return
 // the data that was written to it, consuming the data in the process. This is not
 // a real FIFO, but rather a file that behaves like one.
@@ -1620,14 +1757,14 @@ class FifoFile final: public File, public kj::EnableAddRefToThis<FifoFile> {
   ~FifoFile() noexcept(false) override {
     // Ensure that we do not leak the external memory adjustment.
     KJ_IF_SOME(ema, maybeExternalMemoryAdjustment) {
-      ema.adjust(-fifoBuffer.size());
+      ema.adjust(-static_cast<int32_t>(ringBuffer.getCapacity()));
     }
   }
 
   Stat stat(jsg::Lock& js) override {
     return Stat{
       .type = FsType::FILE,
-      .size = static_cast<uint32_t>(fifoBuffer.size()),
+      .size = static_cast<uint32_t>(ringBuffer.size()),
       .lastModified = kj::UNIX_EPOCH,
       .writable = true,
       .device = true,
@@ -1663,48 +1800,28 @@ class FifoFile final: public File, public kj::EnableAddRefToThis<FifoFile> {
   }
 
   void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override {
-    tracker.trackFieldWithSize("buffer", fifoBuffer.size());
+    tracker.trackFieldWithSize("buffer", ringBuffer.getCapacity());
   }
 
   kj::OneOf<FsError, uint32_t> write(
       jsg::Lock& js, uint32_t offset, kj::ArrayPtr<const kj::byte> buffer) override {
-    // Append data to the end of the FIFO buffer, ignoring offset
-    if ((fifoBuffer.size() + buffer.size()) > 0xFFFFFFFF) {
-      return FsError::FILE_SIZE_LIMIT_EXCEEDED;
+    // Append data to the FIFO ring buffer, ignoring offset
+    int64_t capacityChange = ringBuffer.write(buffer);
+
+    if (capacityChange != 0) {
+      KJ_IF_SOME(ema, maybeExternalMemoryAdjustment) {
+        ema.adjust(static_cast<int32_t>(capacityChange));
+      } else {
+        maybeExternalMemoryAdjustment =
+            js.getExternalMemoryAdjustment(static_cast<int32_t>(capacityChange));
+      }
     }
-    fifoBuffer.reserve(buffer.size());
-    fifoBuffer.addAll(buffer);
-    KJ_IF_SOME(ema, maybeExternalMemoryAdjustment) {
-      ema.adjust(buffer.size());
-    } else {
-      maybeExternalMemoryAdjustment = js.getExternalMemoryAdjustment(buffer.size());
-    }
+
     return static_cast<uint32_t>(buffer.size());
   }
 
   uint32_t read(jsg::Lock& js, uint32_t offset, kj::ArrayPtr<kj::byte> buffer) const override {
-    // Read from the beginning of the FIFO buffer, consuming data and ignoring offset
-    uint32_t bytesToRead = kj::min(buffer.size(), fifoBuffer.size());
-    KJ_ASSERT(bytesToRead <= fifoBuffer.size());
-
-    if (bytesToRead == 0) {
-      return 0;
-    }
-
-    // Copy the data from the front of the FIFO buffer
-    buffer.slice(0, bytesToRead).copyFrom(fifoBuffer.slice(0, bytesToRead));
-
-    // Remove the data that was read from the FIFO buffer
-    kj::Vector<kj::byte> newBuffer(fifoBuffer.size() - bytesToRead);
-    newBuffer.asPtr().copyFrom(fifoBuffer.slice(bytesToRead, fifoBuffer.size()));
-    fifoBuffer = kj::mv(newBuffer);
-
-    KJ_IF_SOME(ema, maybeExternalMemoryAdjustment) {
-      int32_t amount = static_cast<int32_t>(bytesToRead);
-      ema.adjust(-amount);
-    }
-
-    return bytesToRead;
+    return ringBuffer.read(buffer);
   }
 
   kj::StringPtr getUniqueId(jsg::Lock&) const override {
@@ -1719,7 +1836,7 @@ class FifoFile final: public File, public kj::EnableAddRefToThis<FifoFile> {
   }
 
  private:
-  mutable kj::Vector<kj::byte> fifoBuffer;
+  mutable GrowableRingBuffer ringBuffer;
   mutable kj::Maybe<jsg::ExternalMemoryAdjustment> maybeExternalMemoryAdjustment;
   mutable kj::Maybe<kj::String> maybeUniqueId;
 };

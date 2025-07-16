@@ -14,6 +14,7 @@
 #include <workerd/io/frankenvalue.h>
 #include <workerd/io/promise-wrapper.h>
 #include <workerd/io/tracer.h>
+#include <workerd/io/worker-fs.h>
 #include <workerd/io/worker.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/inspector.h>
@@ -1831,6 +1832,44 @@ void Worker::processEntrypointClass(jsg::Lock& js,
     }
   });
 }
+
+// Helper function to write formatted console output to FIFO streams
+namespace {
+void writeToFifoStream(jsg::Lock& js, VirtualFileSystem::Stdio stdio, kj::StringPtr message) {
+  try {
+    auto& vfs = VirtualFileSystem::current(js);
+    auto stdioFile = vfs.getStdio(js, stdio);
+
+    // Convert string to byte array with newline
+    auto messageWithNewline = kj::str(message, "\n");
+    auto data = kj::heapArray<kj::byte>(messageWithNewline.size());
+    memcpy(data.begin(), messageWithNewline.begin(), messageWithNewline.size());
+
+    // Get the underlying File from the FsNode and write to it
+    KJ_SWITCH_ONEOF(stdioFile->node) {
+      KJ_CASE_ONEOF(file, kj::Rc<File>) {
+        auto result = file->write(js, 0, data.asPtr());
+        KJ_SWITCH_ONEOF(result) {
+          KJ_CASE_ONEOF(error, FsError) {
+            // Silently ignore FIFO write errors to avoid breaking console logging
+          }
+          KJ_CASE_ONEOF(bytesWritten, uint32_t) {
+            // Success - do nothing
+          }
+        }
+      }
+      KJ_CASE_ONEOF(dir, kj::Rc<Directory>) {
+        // Should not happen for stdio streams
+      }
+      KJ_CASE_ONEOF(link, kj::Rc<SymbolicLink>) {
+        // Should not happen for stdio streams
+      }
+    }
+  } catch (...) {
+    // Silently ignore any exceptions to avoid breaking console logging
+  }
+}
+}  // namespace
 
 void Worker::handleLog(jsg::Lock& js,
     ConsoleMode consoleMode,

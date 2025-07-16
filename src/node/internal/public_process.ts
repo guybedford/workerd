@@ -20,8 +20,8 @@ import { parseEnv } from 'node-internal:internal_utils';
 import type * as NodeFS from 'node:fs';
 import { Writable } from 'node-internal:streams_writable';
 import type { Readable } from 'node-internal:streams_readable';
-import { ReadStream } from 'node-internal:internal_fs_streams';
 import { writeSync } from 'node-internal:internal_fs_sync';
+import { ReadStream } from 'node-internal:internal_fs_streams';
 
 const { compatibilityFlags } = Cloudflare;
 
