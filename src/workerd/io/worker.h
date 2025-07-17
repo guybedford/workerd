@@ -240,6 +240,9 @@ class Worker::Script: public kj::AtomicRefcounted {
   inline bool isPython() const {
     return python;
   }
+  inline WorkerLanguage getLanguage() const {
+    return language;
+  }
 
   struct CompiledGlobal {
     jsg::V8Ref<v8::String> name;
@@ -269,6 +272,7 @@ class Worker::Script: public kj::AtomicRefcounted {
   kj::String id;
   bool modular;
   bool python;
+  WorkerLanguage language;
 
   struct Impl;
   kj::Own<Impl> impl;

@@ -8,6 +8,22 @@ namespace workerd {
 
 using kj::byte;
 
+enum class WorkerLanguage {
+  RUST,
+  JS,
+  COMMUNITY_GO,
+  PYTHON,
+};
+
+// Forward declaration
+struct WorkerSource;
+
+// Detect the language of a WorkerSource
+WorkerLanguage detectLanguage(const WorkerSource& source);
+
+// Stringify WorkerLanguage for logging/metrics
+kj::StringPtr KJ_STRINGIFY(const WorkerLanguage& l);
+
 // Represents the source code for a Worker.
 //
 // Typically the Worker's source is delivered in a capnp message structure. However, workerd vs.

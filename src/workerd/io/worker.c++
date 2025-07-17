@@ -1259,6 +1259,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
       id(kj::str(id)),
       modular(source.variant.is<ModulesSource>()),
       python(modular && source.variant.get<ModulesSource>().isPython),
+      language(detectLanguage(source)),
       impl(kj::heap<Impl>()) {
   auto parseMetrics = isolate->metrics->parse(startType);
   // TODO(perf): It could make sense to take an async lock when constructing a script if we
