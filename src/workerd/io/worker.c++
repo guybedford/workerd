@@ -30,6 +30,9 @@
 #include <workerd/util/uuid.h>
 #include <workerd/util/xthreadnotifier.h>
 
+#include <workerd/rust/wasm-analysis/lib.rs.h>
+#include <kj-rs/kj-rs.h>
+
 #include <v8-inspector.h>
 #include <v8-profiler.h>
 
@@ -58,6 +61,92 @@
 #endif
 
 namespace workerd {
+
+using namespace kj_rs;
+using namespace workerd::rust;
+
+WorkerLanguage detectLanguage(const WorkerSource& source) {
+  // Check if it's a Python worker
+  if (source.variant.is<WorkerSource::ModulesSource>() && 
+      source.variant.get<WorkerSource::ModulesSource>().isPython) {
+    return WorkerLanguage::PYTHON;
+  }
+  
+  // Script-based workers (Service Worker syntax) are always JS
+  if (source.variant.is<WorkerSource::ScriptSource>()) {
+    return WorkerLanguage::JS;
+  }
+  
+  // For module-based workers, analyze the modules
+  const auto& modulesSource = source.variant.get<WorkerSource::ModulesSource>();
+  kj::StringPtr mainName = modulesSource.mainModule;
+  
+  kj::Maybe<kj::StringPtr> wasmName = kj::none;
+  kj::Maybe<kj::ArrayPtr<const kj::byte>> wasmContent = kj::none;
+  kj::Maybe<kj::StringPtr> mainContent = kj::none;
+  
+  for (const auto& module : modulesSource.modules) {
+    kj::StringPtr name = module.name;
+    const auto& content = module.content;
+    
+    if (content.is<WorkerSource::EsModule>()) {
+      if (name == mainName) {
+        mainContent = content.get<WorkerSource::EsModule>().body;
+      }
+    } else if (content.is<WorkerSource::WasmModule>()) {
+      if (wasmContent == kj::none) {
+        wasmName = name;
+        wasmContent = content.get<WorkerSource::WasmModule>().body;
+      } else {
+        // More than one Wasm -> not a known language toolchain currently
+        return WorkerLanguage::JS;
+      }
+    }
+  }
+  
+  if (wasmContent == kj::none || mainContent == kj::none) return WorkerLanguage::JS;
+  
+  kj::StringPtr wasmFileName = KJ_ASSERT_NONNULL(wasmName);
+  kj::ArrayPtr<const kj::byte> wasmData = KJ_ASSERT_NONNULL(wasmContent);
+  kj::StringPtr mainData = KJ_ASSERT_NONNULL(mainContent);
+  
+  // Use wasm-analysis crate to detect language
+  auto rustResult = wasm_analysis::check_wasm_language(wasmData.as<Rust>());
+  
+  WorkerLanguage detectedLanguage = WorkerLanguage::JS;
+  switch (rustResult) {
+    case wasm_analysis::WorkerLanguage::Rust:
+      detectedLanguage = WorkerLanguage::RUST;
+      break;
+    case wasm_analysis::WorkerLanguage::CommunityGo:
+      detectedLanguage = WorkerLanguage::COMMUNITY_GO;
+      break;
+    case wasm_analysis::WorkerLanguage::Unknown:
+      return WorkerLanguage::JS;
+  }
+  
+  // Verify that the main JS file imports the WASM file
+  if (wasm_analysis::check_has_import(
+          mainData.as<Rust>(), mainName.as<Rust>(), wasmFileName.as<Rust>())) {
+    return detectedLanguage;
+  }
+  
+  return WorkerLanguage::JS;
+}
+
+kj::StringPtr KJ_STRINGIFY(const WorkerLanguage& l) {
+  switch (l) {
+    case WorkerLanguage::RUST:
+      return "rust"_kj;
+    case WorkerLanguage::JS:
+      return "js"_kj;
+    case WorkerLanguage::COMMUNITY_GO:
+      return "community-go"_kj;
+    case WorkerLanguage::PYTHON:
+      return "python"_kj;
+  }
+  KJ_UNREACHABLE;
+}
 
 namespace {
 
@@ -1259,6 +1348,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
       id(kj::str(id)),
       modular(source.variant.is<ModulesSource>()),
       python(modular && source.variant.get<ModulesSource>().isPython),
+      language(detectLanguage(source)),
       impl(kj::heap<Impl>()) {
   auto parseMetrics = isolate->metrics->parse(startType);
   // TODO(perf): It could make sense to take an async lock when constructing a script if we
