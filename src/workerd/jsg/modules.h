@@ -145,6 +145,9 @@ class ModuleRegistry {
     kj::Maybe<SyntheticModuleInfo> maybeSynthetic;
     kj::Maybe<kj::Array<kj::String>> maybeNamedExports;
 
+    // For source phase imports - stores the module source object (e.g., WebAssembly.Module)
+    kj::Maybe<V8Ref<v8::Object>> maybeModuleSourceObject;
+
     ModuleInfo(jsg::Lock& js,
         v8::Local<v8::Module> module,
         kj::Maybe<SyntheticModuleInfo> maybeSynthetic = kj::none);
@@ -166,6 +169,25 @@ class ModuleRegistry {
 
     uint hashCode() const {
       return module.hashCode();
+    }
+
+    // Set the module source object for source phase imports
+    void setModuleSourceObject(jsg::Lock& js, v8::Local<v8::Object> sourceObject) {
+      KJ_LOG(INFO, "setModuleSourceObject called - creating V8Ref");
+      maybeModuleSourceObject = V8Ref<v8::Object>(js.v8Isolate, sourceObject);
+      KJ_LOG(INFO, "setModuleSourceObject completed - V8Ref created successfully");
+    }
+
+    // Get the module source object for source phase imports
+    kj::Maybe<v8::Local<v8::Object>> getModuleSourceObject(jsg::Lock& js) const {
+      KJ_IF_SOME(sourceObject, maybeModuleSourceObject) {
+        KJ_LOG(INFO, "Getting handle from V8Ref");
+        auto handle = sourceObject.getHandle(js);
+        KJ_LOG(INFO, "Successfully got handle from V8Ref", !handle.IsEmpty());
+        return handle;
+      }
+      KJ_LOG(INFO, "No source object stored");
+      return kj::none;
     }
   };
 
@@ -226,6 +248,34 @@ v8::MaybeLocal<v8::Promise> dynamicImportCallback(v8::Local<v8::Context> context
     v8::Local<v8::String> specifier,
     v8::Local<v8::FixedArray> import_attributes);
 
+// Dynamic import callback with phase support - throws error for source phase imports
+// template <typename TypeWrapper>
+// v8::MaybeLocal<v8::Promise> dynamicImportCallbackWithPhase(v8::Local<v8::Context> context,
+//     v8::Local<v8::Data> host_defined_options,
+//     v8::Local<v8::Value> resource_name,
+//     v8::Local<v8::String> specifier,
+//     v8::ModuleImportPhase phase,
+//     v8::Local<v8::FixedArray> import_attributes) {
+//   auto& js = Lock::current();
+
+//   // For source phase dynamic imports, we don't support them - throw an error
+//   if (phase == v8::ModuleImportPhase::kSource) {
+//     const auto makeRejected = [&](auto reason) {
+//       v8::Local<v8::Promise::Resolver> resolver;
+//       if (v8::Promise::Resolver::New(context).ToLocal(&resolver) &&
+//           resolver->Reject(context, reason).IsJust()) {
+//         return resolver->GetPromise();
+//       }
+//       return v8::Local<v8::Promise>();
+//     };
+
+//     return makeRejected(js.v8Error("Dynamic source phase imports are not supported. Use static source phase imports instead: import source x from 'module'"));
+//   }
+
+//   // For evaluation phase, delegate to the regular dynamic import callback
+//   return dynamicImportCallback<TypeWrapper>(context, host_defined_options, resource_name, specifier, import_attributes);
+// }
+
 kj::Maybe<kj::OneOf<kj::String, ModuleRegistry::ModuleInfo>> tryResolveFromFallbackService(Lock& js,
     const kj::Path& specifier,
     kj::Maybe<const kj::Path&>& referrer,
@@ -246,6 +296,7 @@ class ModuleRegistryImpl final: public ModuleRegistry {
     jsg::setAlignedPointerInEmbedderData(
         context, jsg::ContextPointerSlot::MODULE_REGISTRY, registry.get());
     isolate->SetHostImportModuleDynamicallyCallback(dynamicImportCallback<TypeWrapper>);
+    // isolate->SetHostImportModuleWithPhaseDynamicallyCallback(dynamicImportCallbackWithPhase<TypeWrapper>);
     return kj::mv(registry);
   }
 
@@ -282,8 +333,11 @@ class ModuleRegistryImpl final: public ModuleRegistry {
             AllowV8BackgroundThreadsScope scope;
             auto wasmModule =
                 jsg::compileWasmModule(lock, module.getWasm().asBytes(), this->observer);
-            return jsg::ModuleRegistry::ModuleInfo(
+            auto moduleInfo = jsg::ModuleRegistry::ModuleInfo(
                 lock, specifier, kj::none, jsg::ModuleRegistry::WasmModuleInfo(lock, wasmModule));
+            // Set the compiled WebAssembly module as the source object for source phase imports
+            moduleInfo.setModuleSourceObject(lock, wasmModule);
+            return moduleInfo;
           }, module.getType());
           return;
         case Module::DATA:

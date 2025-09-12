@@ -216,6 +216,16 @@ export const wasmModuleTest = {
   },
 };
 
+// Test source phase imports for Wasm modules
+import source wasmSource from 'wasm';
+export const wasmSourcePhaseTest = {
+  async test() {
+    ok(wasmSource instanceof WebAssembly.Module);
+    // The source object should be a WebAssembly.Module that can be instantiated
+    await WebAssembly.instantiate(wasmSource, {});
+  },
+};
+
 // TODO(now): Tests
 // * [x] Include tests for all known module types
 //   * [x] ESM

@@ -9,9 +9,8 @@
 
 #include <kj/mutex.h>
 
-#include <set>
-
 namespace workerd::jsg {
+
 namespace {
 
 // Implementation of `v8::Module::ResolveCallback`.
@@ -112,6 +111,83 @@ v8::MaybeLocal<v8::Module> resolveCallback(v8::Local<v8::Context> context,
     result = v8::MaybeLocal<v8::Module>();
   });
 
+  return result;
+}
+
+// Implementation of `v8::Module::ResolveSourceCallback` for source phase imports.
+v8::MaybeLocal<v8::Object> resolveSourceCallback(v8::Local<v8::Context> context,
+    v8::Local<v8::String> specifier,
+    v8::Local<v8::FixedArray> import_attributes,
+    v8::Local<v8::Module> referrer) {
+  auto& js = Lock::current();
+  v8::MaybeLocal<v8::Object> result;
+
+  // Debug logging
+  auto specString = kj::str(specifier);
+  KJ_LOG(INFO, "resolveSourceCallback called", specString);
+
+  js.tryCatch([&] {
+    // For source phase imports, we need to find the module and return its source object
+    auto registry = getModulesForResolveCallback(js.v8Isolate);
+    KJ_REQUIRE(registry != nullptr, "didn't expect resolveSourceCallback() now");
+    // For now, parse the specifier directly since we don't have a reliable way to get referrer path
+    auto specPath = kj::Path::parse(specString);
+    auto referrerPath = kj::Path::parse(".");  // Default to current directory
+
+    KJ_LOG(INFO, "Parsed paths", specPath.toString(), referrerPath.toString());
+
+    // Resolve the specifier relative to the referrer if it's relative
+    if (specString.startsWith("./") || specString.startsWith("../")) {
+      specPath = referrerPath.eval(specString);
+      KJ_LOG(INFO, "Resolved relative path", specPath.toString());
+    }
+
+    KJ_LOG(INFO, "Attempting to resolve module", specPath.toString());
+
+    // Try to resolve the module
+    KJ_IF_SOME(info,
+        registry->resolve(js, specPath, referrerPath, ModuleRegistry::ResolveOption::DEFAULT,
+            ModuleRegistry::ResolveMethod::IMPORT, specString.asPtr())) {
+
+      KJ_LOG(INFO, "Module resolved successfully");
+
+      // Get the module source object
+      KJ_LOG(INFO, "Getting module source object");
+      KJ_IF_SOME(sourceObject, info.getModuleSourceObject(js)) {
+        KJ_LOG(INFO, "Found source object, checking type");
+
+        // Verify the object is valid before returning
+        if (sourceObject.IsEmpty()) {
+          KJ_LOG(ERROR, "Source object is empty");
+          js.v8Isolate->ThrowException(js.v8Error("Source object is empty"));
+          result = v8::MaybeLocal<v8::Object>();
+        }
+
+        // Check if it's actually an object
+        if (!sourceObject->IsObject()) {
+          KJ_LOG(ERROR, "Source object is not a V8 Object");
+          js.v8Isolate->ThrowException(js.v8Error("Source object is not a V8 Object"));
+          result = v8::MaybeLocal<v8::Object>();
+        }
+
+        KJ_LOG(INFO, "Source object is valid, returning it");
+        result = sourceObject;
+      } else {
+        // Module doesn't support source phase imports
+        auto errorMsg = kj::str(
+            "Source phase import object is not defined for module \"", specPath.toString(), "\"");
+        js.v8Isolate->ThrowException(js.v8Error(errorMsg));
+        result = v8::MaybeLocal<v8::Object>();
+      }
+    } else {
+      auto errorMsg = kj::str("No such module \"", specString, "\"");
+      js.v8Isolate->ThrowException(js.v8Error(errorMsg));
+      result = v8::MaybeLocal<v8::Object>();
+    }
+  }, [&](Value value) {
+    js.v8Isolate->ThrowException(value.getHandle(js));
+    result = v8::MaybeLocal<v8::Object>();
+  });
   return result;
 }
 
@@ -255,6 +331,7 @@ ModuleRegistry* getModulesForResolveCallback(v8::Isolate* isolate) {
 
 void instantiateModule(
     jsg::Lock& js, v8::Local<v8::Module>& module, InstantiateModuleOptions options) {
+  KJ_LOG(INFO, "Instantiate");
   KJ_ASSERT(!module.IsEmpty());
   auto isolate = js.v8Isolate;
   auto context = js.v8Context();
@@ -271,12 +348,18 @@ void instantiateModule(
   if (status == v8::Module::Status::kEvaluated || status == v8::Module::Status::kEvaluating) return;
 
   if (status == v8::Module::Status::kUninstantiated) {
-    jsg::check(module->InstantiateModule(context, &resolveCallback));
+    KJ_LOG(INFO, "About to call InstantiateModule with resolveSourceCallback");
+    jsg::check(module->InstantiateModule(context, &resolveCallback, &resolveSourceCallback));
+    KJ_LOG(INFO, "InstantiateModule completed successfully");
   }
 
   auto prom = jsg::check(module->Evaluate(context)).As<v8::Promise>();
 
-  if (module->IsGraphAsync() && prom->State() == v8::Promise::kPending) {
+  KJ_LOG(INFO, "About to call module->IsGraphAsync()");
+  bool isAsync = module->IsGraphAsync();
+  KJ_LOG(INFO, "IsGraphAsync() completed, result:", isAsync);
+
+  if (isAsync && prom->State() == v8::Promise::kPending) {
     // If top level await has been disable, error.
     JSG_REQUIRE(options != InstantiateModuleOptions::NO_TOP_LEVEL_AWAIT, Error,
         "Top-level await in module is not permitted at this time.");

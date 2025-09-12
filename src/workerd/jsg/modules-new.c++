@@ -1496,8 +1496,12 @@ Module::EvaluateCallback Module::newWasmModuleHandler(kj::ArrayPtr<const kj::byt
         auto lock = cache->mutex.lockShared();
         KJ_IF_SOME(compiled, *lock) {
           auto metrics = observer.onWasmCompilationFromCacheStart(js.v8Isolate);
-          auto result =
-              JsValue(check(v8::WasmModuleObject::FromCompiledModule(js.v8Isolate, compiled)));
+          auto module = check(v8::WasmModuleObject::FromCompiledModule(js.v8Isolate, compiled));
+          auto result = JsValue(module);
+
+          // Set the compiled WASM module as the source object for source phase imports
+          // TODO: Add support for source phase imports in the new module registry
+
           return ns.setDefault(js, result);
         }
       }
@@ -1506,6 +1510,10 @@ Module::EvaluateCallback Module::newWasmModuleHandler(kj::ArrayPtr<const kj::byt
       auto lock = cache->mutex.lockExclusive();
       *lock = module->GetCompiledModule();
       auto result = JsValue(module);
+
+      // Set the compiled WASM module as the source object for source phase imports
+      // TODO: Add support for source phase imports in the new module registry
+
       return ns.setDefault(js, result);
     }, [&](Value exception) {
       js.v8Isolate->ThrowException(exception.getHandle(js));
