@@ -1068,3 +1068,167 @@ fn rc_native_object_dropped_on_minor_gc() {
         Ok(())
     });
 }
+
+// =============================================================================
+// Global<Value> back-reference cycle — known leak
+// =============================================================================
+//
+// This test documents a known limitation: if a Rust resource stores a
+// `jsg::Global<Value>` that (directly or via a closure) refers back to the
+// resource's own JS wrapper, neither minor nor full GC can break the cycle.
+//
+// Why it leaks
+// ------------
+// In C++, `jsg::V8Ref<T>` / `jsg::Function` uses a dual strong/traced mode.
+// When `visitForGc()` is called the handle is switched to a weak
+// `v8::TracedReference` that cppgc's mark phase can follow, allowing the
+// cycle to be detected and collected.
+//
+// Rust `jsg::Global<T>` wraps a plain `v8::Global<T>` with no TracedReference
+// and no dual mode. `GcVisitor` only exposes `visit_ref` for `jsg::Rc<R>`;
+// there is no `visit_js_value` / `visit_global`. The held JS value is
+// therefore an opaque strong root that V8 never traces through, making the
+// cycle invisible to the collector.
+//
+// Practical implication
+// ---------------------
+// The pattern:
+//
+//   nativeObject.on('foo', () => { console.log(nativeObject) })
+//
+// where `on` stores the callback as a `Global<Value>` inside the Rust
+// resource, creates exactly this cycle. The resource will not be collected
+// until the Rust code explicitly drops the `Global<Value>` (e.g. in a
+// `close()` / `removeAllListeners()` call).
+
+static CYCLIC_RESOURCE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Inner resource that holds the JS callback (e.g. an event handler store).
+///
+/// Uses `Cell<Option<…>>` for interior mutability so the `Global` can be
+/// installed via `&self` after the outer resource has been wrapped for JS —
+/// matching the access pattern of `GarbageCollected::trace(&self)`.
+#[jsg_resource]
+struct CallbackHolder {
+    /// The stored JS callback. In production code this would be the closure
+    /// passed to `nativeObject.on('foo', callback)`.
+    callback: std::cell::Cell<Option<jsg::v8::Global<jsg::v8::Value>>>,
+}
+
+impl Drop for CallbackHolder {
+    fn drop(&mut self) {
+        CYCLIC_RESOURCE_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Outer resource (the event target / native object exposed to JS).
+///
+/// Holds an `Rc<CallbackHolder>` — the realistic shape: in production the
+/// inner state is a separate allocation shared between the JS-visible resource
+/// and any internal bookkeeping, and it is the *inner* allocation that stores
+/// the `Global<Value>` callback.
+///
+/// The `Rc<CallbackHolder>` field IS visited by the auto-generated `trace()`
+/// (since `#[jsg_resource]` traces all `jsg::Rc<R>` fields). But the
+/// `Global<Value>` nested inside `CallbackHolder` is invisible to the GC —
+/// `GcVisitor` has no `visit_global`, so tracing stops at `CallbackHolder`'s
+/// boundary and never follows the `Global` to the JS wrapper.
+#[jsg_resource]
+struct EventTargetResource {
+    inner: jsg::Rc<CallbackHolder>,
+}
+
+impl Drop for EventTargetResource {
+    fn drop(&mut self) {
+        CYCLIC_RESOURCE_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// CallbackHolder is not exposed to JS, but must implement Resource so it can
+// be held in a jsg::Rc<> field and traced by the GC machinery.
+#[jsg_resource]
+impl CallbackHolder {}
+
+#[jsg_resource]
+impl EventTargetResource {}
+
+/// Documents that a `Global<Value>` nested inside a `jsg::Rc<Inner>` field
+/// still forms an unbreakable GC cycle even though the `Rc` itself is traced.
+///
+/// Realistic ownership graph:
+///
+/// ```text
+///   jsg::Rc<EventTargetResource>   (GC-traced by parent's visit_ref)
+///     └─► EventTargetResource
+///           └─► jsg::Rc<CallbackHolder>   (GC-traced — visit_ref follows this)
+///                 └─► CallbackHolder
+///                       └─► callback: Global<Value>   (NOT traced — no visit_global)
+///                             └─► JS wrapper of EventTargetResource  ◄─┐
+///   JS wrapper ──► CppgcShim ──► Wrappable ──► EventTargetResource ───┘
+/// ```
+///
+/// The `jsg::Rc<CallbackHolder>` is correctly traced: `visit_ref` transitions
+/// it from strong→weak and tells cppgc about the edge. But `GcVisitor` only
+/// exposes `visit_ref` for `jsg::Rc<R>` — there is no `visit_global`. The
+/// `Global<Value>` inside `CallbackHolder` is an opaque strong V8 root that
+/// the tracer never follows, so the back-edge to the JS wrapper is invisible
+/// and the cycle cannot be collected.
+///
+/// Practical implication: the pattern
+///   `nativeObject.on('foo', () => { use(nativeObject) })`
+/// where `on` stores the callback as a `Global<Value>` anywhere in the
+/// resource graph will leak until the `Global` is explicitly dropped.
+#[test]
+fn global_value_back_ref_is_not_collected_by_gc() {
+    CYCLIC_RESOURCE_DROPS.store(0, Ordering::SeqCst);
+
+    let harness = crate::Harness::new();
+    harness.run_in_context(|lock, _ctx| {
+        let inner = jsg::Rc::new(CallbackHolder {
+            callback: std::cell::Cell::new(None),
+        });
+        let resource = jsg::Rc::new(EventTargetResource {
+            inner: inner.clone(),
+        });
+
+        // Wrap the outer resource to produce its JS object, then promote to a
+        // Global so we can store it back as the "callback" in the inner holder.
+        let wrapper_local = resource.clone().to_js(lock);
+        let wrapper_global = wrapper_local.to_global(lock);
+
+        // Install the back-reference inside the inner holder. This models:
+        //   nativeObject.on('foo', () => { console.log(nativeObject) })
+        // The closure captures the JS wrapper; here we store the wrapper
+        // directly as the Global to keep the cycle as simple as possible.
+        inner.callback.set(Some(wrapper_global));
+
+        // Drop both Rust handles. The Global<Value> inside CallbackHolder
+        // keeps the JS wrapper alive → CppgcShim alive → Wrappable alive →
+        // EventTargetResource alive → jsg::Rc<CallbackHolder> alive →
+        // CallbackHolder alive → Global<Value>. Cycle closed, nothing drops.
+        std::mem::drop(inner);
+        std::mem::drop(resource);
+        assert_eq!(CYCLIC_RESOURCE_DROPS.load(Ordering::SeqCst), 0);
+        Ok(())
+    });
+
+    // Both minor and full GC fail to collect: the Global<Value> is an opaque
+    // strong V8 root the tracer never follows, so the cycle is invisible.
+    harness.run_in_context(|lock, _ctx| {
+        crate::Harness::request_minor_gc(lock);
+        assert_eq!(
+            CYCLIC_RESOURCE_DROPS.load(Ordering::SeqCst),
+            0,
+            "minor GC should NOT collect the cyclic resource"
+        );
+
+        crate::Harness::request_gc(lock);
+        assert_eq!(
+            CYCLIC_RESOURCE_DROPS.load(Ordering::SeqCst),
+            0,
+            "full GC should NOT collect the cyclic resource — \
+             Global<Value> back-reference is opaque to the GC tracer"
+        );
+        Ok(())
+    });
+}
