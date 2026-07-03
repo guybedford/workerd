@@ -566,6 +566,12 @@ jsg::Ref<Socket> SocketsModule::connect(
   return connectImpl(js, kj::none, kj::mv(address), kj::mv(options));
 }
 
+jsg::Optional<kj::StringPtr> SocketsModule::getCallerDnsOverride(
+    jsg::Lock& js, kj::String hostname) {
+  auto& ioContext = IoContext::current();
+  return ioContext.getCurrentLock().getGlobalScope().getDnsOverride(hostname);
+}
+
 kj::Own<kj::AsyncIoStream> Socket::takeConnectionStream(jsg::Lock& js) {
   // Set this so that if `close` is called after this, that no closure steps are taken and instead
   // the `close` is a no-op.
